@@ -19,12 +19,12 @@ jobs:
         with:
           context: .
           push: true
-          tags: yourdockerusername/node-app:${{ github.sha }}
+          tags: thangapandi78/node-app:${{ github.sha }}
       - name: Update gitops-repo
         run: |
           git clone https://x:${{ secrets.GITOPS_TOKEN }}@github.com/Thangam78/gitops-repo.git
           cd gitops-repo
-          sed -i "s|image: yourdockerusername/node-app:.*|image: yourdockerusername/node-app:${{ github.sha }}|" deployment.yaml
+          sed -i "s|image: thangapandi78/node-app:.*|image: thangapandi78/node-app:${{ github.sha }}|" deployment.yaml
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add .
