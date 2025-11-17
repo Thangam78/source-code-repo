@@ -15,7 +15,7 @@ default_args = {
 dag = DAG(
     'download_files_from_private_repo',
     default_args=default_args,
-    description='Download files from private Git repository',
+    description='Download specific files from private Git repository without cloning',
     schedule_interval=None,
     catchup=False,
     tags=['git', 'download'],
@@ -23,12 +23,12 @@ dag = DAG(
 
 # Configuration variables
 GIT_PAT = "{{ var.value.git_pat }}"  # Store in Airflow Variables
-REPO_URL = "{{ var.value.repo_url }}"  # e.g., https://github.com/username/repo.git
+REPO_URL = "{{ var.value.repo_url }}"  # e.g., https://github.com/username/repo or https://github.com/username/repo.git
 BRANCH_NAME = "{{ var.value.branch_name }}"  # e.g., main
 FILES_PATH = "{{ var.value.files_path }}"  # Comma-separated: path/file1.txt,path/file2.py
 DOWNLOAD_FOLDER = "{{ var.value.download_folder }}"  # e.g., /tmp/downloads
-IS_BASE64_ENCODED = "{{ var.value.is_base64_encoded }}"  # true or false
-ENCODE_FILES_BASE64 = "{{ var.value.encode_files_base64 }}"  # true or false
+IS_BASE64_ENCODED = "{{ var.value.is_base64_encoded }}"  # true or false (for PAT)
+ENCODE_FILES_BASE64 = "{{ var.value.encode_files_base64 }}"  # true or false (for downloaded files)
 
 bash_script = """
 #!/bin/bash
@@ -43,7 +43,7 @@ DOWNLOAD_FOLDER="{{ params.download_folder }}"
 IS_BASE64_ENCODED="{{ params.is_base64_encoded }}"
 ENCODE_FILES_BASE64="{{ params.encode_files_base64 }}"
 
-echo "=== Starting Git File Download Process ==="
+echo "=== Starting Git File Download Process (Direct Download - No Clone) ==="
 echo "Repository: $REPO_URL"
 echo "Branch: $BRANCH_NAME"
 echo "Download Folder: $DOWNLOAD_FOLDER"
@@ -59,79 +59,104 @@ fi
 mkdir -p "$DOWNLOAD_FOLDER"
 
 # Extract repo details from URL
-REPO_URL_CLEANED=$(echo "$REPO_URL" | sed 's|\.git$||')
-REPO_HOST=$(echo "$REPO_URL_CLEANED" | sed -E 's|https?://||' | cut -d'/' -f1)
-REPO_PATH=$(echo "$REPO_URL_CLEANED" | sed -E 's|https?://[^/]+/||')
+REPO_URL_CLEANED=$(echo "$REPO_URL" | sed 's|\.git$||' | sed 's|/$||')
 
-echo "Repository Host: $REPO_HOST"
-echo "Repository Path: $REPO_PATH"
+# Detect Git platform and construct raw file URL pattern
+if [[ "$REPO_URL_CLEANED" == *"github.com"* ]]; then
+    # GitHub: Extract owner and repo
+    REPO_INFO=$(echo "$REPO_URL_CLEANED" | sed -E 's|https?://github.com/||')
+    PLATFORM="github"
+    echo "Platform: GitHub"
+elif [[ "$REPO_URL_CLEANED" == *"gitlab"* ]]; then
+    # GitLab: Extract project path
+    REPO_INFO=$(echo "$REPO_URL_CLEANED" | sed -E 's|https?://[^/]+/||')
+    PLATFORM="gitlab"
+    echo "Platform: GitLab"
+elif [[ "$REPO_URL_CLEANED" == *"bitbucket"* ]]; then
+    # Bitbucket: Extract workspace and repo
+    REPO_INFO=$(echo "$REPO_URL_CLEANED" | sed -E 's|https?://bitbucket.org/||')
+    PLATFORM="bitbucket"
+    echo "Platform: Bitbucket"
+else
+    echo "Error: Unsupported Git platform"
+    exit 1
+fi
 
-# Create authenticated URL
-AUTH_URL="https://${GIT_PAT}@${REPO_HOST}/${REPO_PATH}.git"
+echo "Repository Info: $REPO_INFO"
 
-# Create a temporary directory for cloning
-TEMP_DIR=$(mktemp -d)
-echo "Temporary directory: $TEMP_DIR"
-
-# Cleanup function
-cleanup() {
-    echo "Cleaning up temporary directory..."
-    rm -rf "$TEMP_DIR"
+# Function to download a single file
+download_file() {
+    local file_path="$1"
+    local dest_path="$DOWNLOAD_FOLDER/$file_path"
+    
+    # Create directory structure
+    mkdir -p "$(dirname "$dest_path")"
+    
+    # Construct raw file URL based on platform
+    case "$PLATFORM" in
+        github)
+            RAW_URL="https://raw.githubusercontent.com/${REPO_INFO}/${BRANCH_NAME}/${file_path}"
+            ;;
+        gitlab)
+            # URL encode the file path for GitLab
+            ENCODED_PATH=$(echo "$file_path" | sed 's|/|%2F|g')
+            RAW_URL="https://gitlab.com/${REPO_INFO}/-/raw/${BRANCH_NAME}/${file_path}"
+            ;;
+        bitbucket)
+            RAW_URL="https://bitbucket.org/${REPO_INFO}/raw/${BRANCH_NAME}/${file_path}"
+            ;;
+    esac
+    
+    echo "Downloading: $file_path"
+    echo "URL: $RAW_URL"
+    
+    # Download file using curl with authentication
+    HTTP_CODE=$(curl -s -w "%{http_code}" -H "Authorization: token ${GIT_PAT}" \
+                     -H "Accept: application/vnd.github.v3.raw" \
+                     -o "/tmp/temp_download_$$" \
+                     -L "$RAW_URL")
+    
+    if [ "$HTTP_CODE" -eq 200 ]; then
+        if [ "$ENCODE_FILES_BASE64" = "true" ]; then
+            # Encode to base64 and save with .b64 extension
+            base64 "/tmp/temp_download_$$" > "${dest_path}.b64"
+            echo "✓ Downloaded (Base64): $file_path -> ${file_path}.b64"
+        else
+            # Move file to destination
+            mv "/tmp/temp_download_$$" "$dest_path"
+            echo "✓ Downloaded: $file_path"
+        fi
+        rm -f "/tmp/temp_download_$$"
+        return 0
+    else
+        echo "✗ Failed to download: $file_path (HTTP $HTTP_CODE)"
+        rm -f "/tmp/temp_download_$$"
+        return 1
+    fi
 }
-trap cleanup EXIT
 
-# Clone the repository with sparse checkout
-echo "Initializing sparse checkout..."
-cd "$TEMP_DIR"
-git init
-git remote add origin "$AUTH_URL"
-git config core.sparseCheckout true
-
-# Parse comma-separated file paths and add to sparse-checkout
+# Parse comma-separated file paths and download each file
 IFS=',' read -ra FILE_ARRAY <<< "$FILES_PATH"
+DOWNLOAD_COUNT=0
+FAILED_COUNT=0
+
 for file_path in "${FILE_ARRAY[@]}"; do
     # Trim whitespace
     file_path=$(echo "$file_path" | xargs)
-    echo "$file_path" >> .git/info/sparse-checkout
-    echo "Added to sparse-checkout: $file_path"
-done
-
-# Pull only the specified branch and files
-echo "Pulling files from branch: $BRANCH_NAME"
-git pull origin "$BRANCH_NAME"
-
-# Copy downloaded files to the destination folder
-echo "Copying files to destination folder..."
-DOWNLOAD_COUNT=0
-for file_path in "${FILE_ARRAY[@]}"; do
-    file_path=$(echo "$file_path" | xargs)
-    if [ -f "$file_path" ]; then
-        # Create directory structure in destination
-        FILE_DIR=$(dirname "$file_path")
-        mkdir -p "$DOWNLOAD_FOLDER/$FILE_DIR"
-        
-        # Determine destination file path
-        DEST_FILE="$DOWNLOAD_FOLDER/$file_path"
-        
-        # Copy or encode file based on configuration
-        if [ "$ENCODE_FILES_BASE64" = "true" ]; then
-            # Encode file content to base64 and save with .b64 extension
-            base64 "$file_path" > "${DEST_FILE}.b64"
-            echo "✓ Downloaded (Base64): $file_path -> ${file_path}.b64"
+    
+    if [ -n "$file_path" ]; then
+        if download_file "$file_path"; then
+            DOWNLOAD_COUNT=$((DOWNLOAD_COUNT + 1))
         else
-            # Copy file as-is
-            cp "$file_path" "$DEST_FILE"
-            echo "✓ Downloaded: $file_path"
+            FAILED_COUNT=$((FAILED_COUNT + 1))
         fi
-        
-        DOWNLOAD_COUNT=$((DOWNLOAD_COUNT + 1))
-    else
-        echo "✗ File not found: $file_path"
     fi
 done
 
+echo ""
 echo "=== Download Complete ==="
-echo "Total files downloaded: $DOWNLOAD_COUNT"
+echo "Total files successfully downloaded: $DOWNLOAD_COUNT"
+echo "Total files failed: $FAILED_COUNT"
 echo "Files location: $DOWNLOAD_FOLDER"
 
 # List downloaded files
@@ -144,6 +169,11 @@ if [ "$ENCODE_FILES_BASE64" = "true" ]; then
     echo ""
     echo "Note: Files are Base64 encoded with .b64 extension"
     echo "To decode a file, use: base64 -d <filename>.b64 > <filename>"
+fi
+
+# Exit with error if any downloads failed
+if [ "$FAILED_COUNT" -gt 0 ]; then
+    exit 1
 fi
 """
 
